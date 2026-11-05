@@ -1,0 +1,244 @@
+#!/usr/bin/env bash
+# sync-guest-display
+#
+# Keep a Hyprland output in sync with the resolution reported by a QEMU/KVM
+# virtio-gpu display. When the VM window is resized, QEMU updates the virtual
+# GPU's preferred mode and the kernel emits a DRM "change" uevent; Hyprland
+# does not apply that new mode on its own, so this watcher does it.
+#
+# Inspired by https://github.com/m1st0/wayland_guest_resize (Apache-2.0)
+# SPDX-License-Identifier: Apache-2.0
+#
+# Environment overrides:
+#   SYNC_GUEST_OUTPUT   Hyprland output name to manage (default: auto-detect
+#                       the first connected Virtual-* connector, e.g. Virtual-1)
+#   SYNC_GUEST_DRM_GLOB connector glob used for auto-detection
+#                       (default: /sys/class/drm/card*-Virtual-*)
+#
+# Usage:
+#   sync-guest-display          apply the current mode, then watch for resizes
+#   sync-guest-display --once   apply the current mode once and exit
+#   sync-guest-display --help   show this help
+
+# No -e: failures are handled explicitly, and a failed resize must not kill
+# the watcher.
+set -uo pipefail
+
+readonly PROG="${0##*/}"
+readonly DRM_GLOB="${SYNC_GUEST_DRM_GLOB:-/sys/class/drm/card*-Virtual-*}"
+readonly FORCED_OUTPUT="${SYNC_GUEST_OUTPUT:-}"
+
+CONN_DIR=""
+CONN_OUTPUT=""
+APPLY_STYLE="eval"
+FORCE=0
+
+# Current geometry of the managed Hyprland output, filled by current_geometry().
+CUR_W="" CUR_H="" CUR_X="" CUR_Y="" CUR_SCALE=""
+
+log() { printf '%s [%s] %s\n' "$(date '+%F %T')" "$PROG" "$*" >&2; }
+die() { log "ERROR: $*"; exit 1; }
+require() { command -v "$1" >/dev/null 2>&1 || die "required command not found: $1"; }
+
+usage() {
+    awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "$0"
+}
+
+# Resolve which DRM connector and Hyprland output to manage.
+detect() {
+    local dir name
+    local -a dirs=()
+
+    if [[ -n $FORCED_OUTPUT ]]; then
+        for dir in /sys/class/drm/card*-"$FORCED_OUTPUT"; do
+            [[ -e "$dir/modes" ]] || continue
+            CONN_DIR="$dir"
+            CONN_OUTPUT="$FORCED_OUTPUT"
+            return 0
+        done
+        die "no DRM connector found for output '$FORCED_OUTPUT'"
+    fi
+
+    shopt -s nullglob
+    # Intentional unquoted expansion: DRM_GLOB is a glob pattern, not a path.
+    # shellcheck disable=SC2206
+    dirs=($DRM_GLOB)
+    shopt -u nullglob
+
+    # Prefer a connected and enabled connector; fall back to any with modes.
+    for dir in "${dirs[@]}"; do
+        [[ -e "$dir/modes" ]] || continue
+        [[ "$(cat "$dir/status" 2>/dev/null)" == "connected" ]] || continue
+        [[ "$(cat "$dir/enabled" 2>/dev/null)" == "enabled" ]] || continue
+        name=${dir##*/}
+        CONN_DIR="$dir"
+        CONN_OUTPUT="${name#*-}"
+        return 0
+    done
+
+    for dir in "${dirs[@]}"; do
+        [[ -e "$dir/modes" ]] || continue
+        name=${dir##*/}
+        CONN_DIR="$dir"
+        CONN_OUTPUT="${name#*-}"
+        return 0
+    done
+
+    die "no virtual DRM connector matched '$DRM_GLOB' (set SYNC_GUEST_OUTPUT)"
+}
+
+# Hyprland renamed/extended its IPC over time: recent versions evaluate Lua
+# with `hyprctl eval` and expose hl.monitor, older ones use `hyprctl keyword`.
+detect_apply_style() {
+    if hyprctl --help 2>/dev/null | grep -qE '^[[:space:]]+eval[[:space:]]'; then
+        APPLY_STYLE="eval"
+    else
+        APPLY_STYLE="keyword"
+    fi
+}
+
+# Read the current geometry of CONN_OUTPUT from Hyprland.
+current_geometry() {
+    local values
+    values=$(hyprctl monitors all -j 2>/dev/null | jq -r --arg o "$CONN_OUTPUT" '
+        .[] | select(.name == $o) |
+        "\(.width) \(.height) \(.x) \(.y) \(.scale)"' 2>/dev/null) || return 1
+    [[ -n $values ]] || return 1
+    read -r CUR_W CUR_H CUR_X CUR_Y CUR_SCALE <<<"$values"
+    [[ -n ${CUR_W:-} ]]
+}
+
+# Refresh rates Hyprland knows for a given resolution, one per line.
+available_refreshes() {
+    local res="$1"
+    hyprctl monitors all -j 2>/dev/null | jq -r \
+        --arg o "$CONN_OUTPUT" --arg r "$res" '
+        .[] | select(.name == $o) | .availableModes[] |
+        select(startswith($r + "@"))' 2>/dev/null |
+        awk -F'@' -v r="$res" '$1 == r { sub(/Hz$/, "", $2); print $2 }'
+}
+
+# Pick the best refresh rate Hyprland knows for a resolution: the fastest one
+# at or below 60 Hz, otherwise the slowest available, otherwise assume 60 Hz.
+best_mode() {
+    local res="$1" refresh
+
+    refresh=$(available_refreshes "$res" | sort -g |
+        awk '$1 <= 60 { keep = $1 } END { if (keep != "") print keep }')
+    [[ -n $refresh ]] || refresh=$(available_refreshes "$res" | sort -g | head -n1)
+
+    if [[ -n $refresh ]]; then
+        printf '%s@%s' "$res" "$refresh"
+    else
+        printf '%s@60' "$res"
+    fi
+}
+
+# Send a monitor rule to Hyprland, using whichever IPC style it supports.
+apply_monitor() {
+    local mode="$1" pos="$2" scale="$3"
+
+    if [[ $APPLY_STYLE == eval ]]; then
+        hyprctl eval "hl.monitor({ output = \"$CONN_OUTPUT\", mode = \"$mode\", position = \"$pos\", scale = $scale })" 2>&1
+    else
+        hyprctl keyword monitor "$CONN_OUTPUT,$mode,$pos,$scale" 2>&1
+    fi
+}
+
+# Apply the connector's current preferred resolution. The mode is recomputed
+# on each attempt because Hyprland may need a moment to notice the connector's
+# new mode list after the DRM uevent. "preferred" is the final fallback.
+apply_mode() {
+    local res="$1" mode out rc attempt
+    local pos="${CUR_X}x${CUR_Y}"
+    local scale="${CUR_SCALE:-1}"
+
+    for attempt in 1 2 3 4 5; do
+        mode=$(best_mode "$res")
+        out=$(apply_monitor "$mode" "$pos" "$scale")
+        rc=$?
+        if [[ $rc -eq 0 && $out != *rror* ]] && sleep 0.2 && current_geometry &&
+            [[ "${CUR_W}x${CUR_H}" == "$res" ]]; then
+            log "applied $mode to $CONN_OUTPUT"
+            return 0
+        fi
+        log "attempt $attempt for $mode failed (${out:-no output}); retrying"
+        sleep 0.4
+    done
+
+    out=$(apply_monitor "preferred" "$pos" "$scale")
+    if [[ $? -eq 0 && $out != *rror* ]] && sleep 0.2 && current_geometry &&
+        [[ "${CUR_W}x${CUR_H}" == "$res" ]]; then
+        log "applied preferred mode ($res) to $CONN_OUTPUT"
+        return 0
+    fi
+
+    return 1
+}
+
+# Compare the connector's preferred mode with the live Hyprland resolution.
+resize_guest() {
+    local res target
+
+    if [[ ! -e $CONN_DIR/modes ]]; then
+        detect
+    fi
+
+    res=$(head -n1 "$CONN_DIR/modes" 2>/dev/null)
+    if [[ -z $res ]]; then
+        log "no mode reported by ${CONN_DIR##*/}"
+        return 0
+    fi
+
+    current_geometry || { log "Hyprland does not report output $CONN_OUTPUT"; return 0; }
+
+    if ((FORCE == 0)) && [[ "${CUR_W}x${CUR_H}" == "$res" ]]; then
+        log "no resize (already ${res})"
+        return 0
+    fi
+
+    target=$(best_mode "$res")
+    log "display size is $res; switching $CONN_OUTPUT to $target"
+    apply_mode "$res" || log "could not apply $res to $CONN_OUTPUT"
+}
+
+case "${1:-}" in
+    -h|--help)
+        usage
+        exit 0
+        ;;
+    --once|--force)
+        FORCE=1
+        ;;
+    "")
+        ;;
+    *)
+        die "unknown argument: $1 (try --help)"
+        ;;
+esac
+
+require hyprctl
+require udevadm
+require jq
+
+detect
+detect_apply_style
+current_geometry || die "Hyprland output '$CONN_OUTPUT' not found"
+
+resize_guest
+
+if ((FORCE == 1)); then
+    exit 0
+fi
+
+log "watching DRM events for ${CONN_DIR##*/}"
+
+while IFS= read -r line; do
+    [[ $line == *change* && $line == */drm/* ]] || continue
+    # Let the connector settle before reading its mode list.
+    sleep 0.6
+    resize_guest
+done < <(udevadm monitor --udev --subsystem-match=drm)
+
+log "udevadm monitor exited; restarting required"
+exit 1
